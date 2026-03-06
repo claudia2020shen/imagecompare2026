@@ -1,9 +1,9 @@
 import torch
+import numpy as np
 from torch.nn.functional import cosine_similarity
 import comfy.clip_vision
 import folder_paths
-# 新增：导入CLIP的图像预处理
-from transformers import CLIPImageProcessor
+from PIL import Image
 
 class ImageCLIPSimilarity:
     @classmethod
@@ -12,7 +12,8 @@ class ImageCLIPSimilarity:
             "required": {
                 "image_a": ("IMAGE",),
                 "image_b": ("IMAGE",),
-                "clip_vision_model": ("CLIP_VISION",),
+                # 改用模型名称选择，而非直接传入CLIP_VISION对象（避免封装兼容问题）
+                "clip_vision_name": (folder_paths.get_filename_list("clip_vision"),),
             }
         }
 
@@ -22,43 +23,51 @@ class ImageCLIPSimilarity:
     CATEGORY = "Analysis/Image"
     DESCRIPTION = "Calculates semantic similarity between two images using CLIP Vision embeddings."
 
-    def calculate_similarity(self, image_a, image_b, clip_vision_model):
-        device = next(clip_vision_model.parameters()).device if hasattr(clip_vision_model, 'parameters') else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+    def calculate_similarity(self, image_a, image_b, clip_vision_name):
+        # 1. 手动加载CLIP Vision模型（绕过ComfyUI的封装兼容问题）
+        clip_vision_path = folder_paths.get_full_path("clip_vision", clip_vision_name)
+        clip_vision = comfy.clip_vision.load_clip_vision(clip_vision_path)
+        device = clip_vision.device  # 直接用模型的设备，100%对齐
+
         try:
-            # 初始化CLIP图像处理器（原生方式，兼容所有CLIP Vision模型）
-            image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+            # 2. 通用图像预处理函数（适配ComfyUI IMAGE格式）
+            def process_image(img_tensor):
+                # ComfyUI IMAGE: [B, H, W, C] → 转PIL → 适配CLIP输入
+                # 取批次第一张
+                if img_tensor.shape[0] > 0:
+                    img_tensor = img_tensor[0]
+                # 从0-1转0-255，转numpy，再转PIL
+                img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+                pil_img = Image.fromarray(img_np).convert("RGB")  # 强制RGB
+                # 用ComfyUI内置的CLIP图像预处理
+                processed = clip_vision.preprocess(pil_img).unsqueeze(0).to(device)
+                return processed
 
-            def preprocess_image_comfy(image):
-                # 1. 处理ComfyUI图像：[B, H, W, C] → [H, W, C]（单张）
-                if image.shape[0] > 1:
-                    image = image[0]  # 取第一张
-                # 2. 转换为PIL图像（原生CLIP预处理需要）
-                image_np = (image.cpu().numpy() * 255).astype("uint8")
-                from PIL import Image
-                pil_image = Image.fromarray(image_np)
-                # 3. 用CLIP原生处理器预处理
-                inputs = image_processor(images=pil_image, return_tensors="pt")
-                pixel_values = inputs["pixel_values"].to(device)
-                return pixel_values
+            # 3. 处理两张图片
+            img_a_processed = process_image(image_a)
+            img_b_processed = process_image(image_b)
 
-            # 预处理两张图片
-            img_a = preprocess_image_comfy(image_a)
-            img_b = preprocess_image_comfy(image_b)
-
-            # 手动编码图像（绕过ComfyUI的封装）
+            # 4. 提取CLIP Embedding（用ComfyUI官方推荐的方式）
             with torch.no_grad():
-                outputs_a = clip_vision_model.model(pixel_values=img_a)
-                outputs_b = clip_vision_model.model(pixel_values=img_b)
-                # 提取embedding（用CLIP官方的方式：last_hidden_state的均值）
-                vec_a = outputs_a.last_hidden_state.mean(dim=1)
-                vec_b = outputs_b.last_hidden_state.mean(dim=1)
+                # encode_image返回dict，包含image_embeds（核心embedding）
+                embed_a = clip_vision.encode_image(img_a_processed)
+                embed_b = clip_vision.encode_image(img_b_processed)
+                
+                # 关键：优先用image_embeds（部分版本叫pooler_output，兼容处理）
+                vec_a = embed_a.get("image_embeds", embed_a.get("pooler_output"))
+                vec_b = embed_b.get("image_embeds", embed_b.get("pooler_output"))
 
-            # 计算余弦相似度
-            sim_tensor = cosine_similarity(vec_a, vec_b, dim=1)
-            similarity_score = sim_tensor.item()
+                # 确保维度正确
+                vec_a = vec_a.squeeze()  # 去除多余维度
+                vec_b = vec_b.squeeze()
 
-            # 生成状态信息
+            # 5. 计算余弦相似度（增加维度校验）
+            if vec_a.dim() == 1 and vec_b.dim() == 1:
+                similarity_score = cosine_similarity(vec_a.unsqueeze(0), vec_b.unsqueeze(0), dim=1).item()
+            else:
+                similarity_score = cosine_similarity(vec_a, vec_b, dim=-1).mean().item()
+
+            # 6. 生成状态信息
             status = f"CLIP Similarity: {similarity_score:.4f}"
             if similarity_score > 0.90:
                 status += " (几乎相同 / Nearly Identical)"
@@ -74,7 +83,7 @@ class ImageCLIPSimilarity:
             return (similarity_score, status)
 
         except Exception as e:
-            error_msg = f"Error: {str(e)}"
+            error_msg = f"计算失败: {str(e)}"
             return (0.0, error_msg)
 
 # 注册节点
